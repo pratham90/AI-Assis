@@ -5,6 +5,7 @@ function createWindow() {
   const win = new BrowserWindow({
     width: 1000,
     height: 700,
+      show: false,  
     transparent: true,
     frame: false, // No OS window border
     backgroundColor: '#00000000', // Fully transparent
@@ -22,6 +23,15 @@ function createWindow() {
 
   // Optional: Always on top
   // win.setAlwaysOnTop(true);
+    win.once('ready-to-show', () => win.show());
+
+  // 2) Force CSS overrides at runtime (bulletproof against build quirks)
+  win.webContents.on('did-finish-load', () => {
+    win.webContents.insertCSS(`
+      html, body, #root { background: transparent !important; }
+      .cluely-widget    { background: transparent !important; }
+    `);
+  });
 }
 
 app.whenReady().then(createWindow);

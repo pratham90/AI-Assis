@@ -1,31 +1,88 @@
+    # ...existing code...
 from flask import Flask, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
 from flask_cors import CORS
 import os
 import sys
 import platform
 
-# Ensure imports work when running from backend directory
+from pymongo import MongoClient
+from dotenv import load_dotenv
+
+import pathlib
+# Robust .env loading for EXE and dev
+def robust_load_dotenv():
+    # Try current working dir
+    dotenv_paths = [
+        pathlib.Path.cwd() / '.env',
+        pathlib.Path(__file__).parent / '.env'
+    ]
+    # If running in PyInstaller bundle, also try _MEIPASS
+    if hasattr(sys, '_MEIPASS'):
+        dotenv_paths.append(pathlib.Path(sys._MEIPASS) / '.env')
+    for dotenv_path in dotenv_paths:
+        if dotenv_path.exists():
+            load_dotenv(dotenv_path)
+            print(f"[DEBUG] Loaded .env from: {dotenv_path}")
+            break
+    else:
+        print("[WARNING] .env file not found in any expected location!")
+
+robust_load_dotenv()
+from gpt_engine import GPTEngine
+from resume_parser import extract_text_from_pdf
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from gpt_engine import GPTEngine
-from resume_parser import extract_text_from_pdf
-
 def get_frontend_build_dir() -> str:
     """Resolve the path to the React build directory, compatible with PyInstaller."""
-    # If packaged by PyInstaller, data is under _MEIPASS
     if hasattr(sys, '_MEIPASS'):
         packaged_dir = os.path.join(sys._MEIPASS, 'frontend', 'build')
         if os.path.exists(packaged_dir):
             return packaged_dir
-    # Default: use workspace build dir
     return os.path.join(PROJECT_ROOT, 'frontend', 'build')
 
 FRONTEND_BUILD_DIR = get_frontend_build_dir()
-print(f"[DEBUG] Frontend build dir: {FRONTEND_BUILD_DIR}")
 print(f"[DEBUG] Frontend build exists: {os.path.exists(FRONTEND_BUILD_DIR)}")
+
+# --- MongoDB Atlas connection ---
+# Replace with your actual MongoDB Atlas connection string
+MONGO_URI = os.environ.get('MONGO_URI', 'YOUR_MONGODB_ATLAS_CONNECTION_STRING')
+client = MongoClient(MONGO_URI)
+db = client['ai_assistant']
+users_col = db['users']
+
+def get_user(email):
+    return users_col.find_one({'email': email})
+
+def create_user(email, password):
+    if get_user(email):
+        return False
+    hashed = generate_password_hash(password)
+    users_col.insert_one({'email': email, 'password': hashed, 'credits': 10})
+    return True
+
+def authenticate(email, password):
+    user = get_user(email)
+    if not user:
+        return False
+    return check_password_hash(user['password'], password)
+
+def get_credits(email):
+    user = get_user(email)
+    if not user:
+        return 0
+    return user.get('credits', 0)
+
+def use_credit(email):
+    user = get_user(email)
+    if not user or user.get('credits', 0) <= 0:
+        return False
+    users_col.update_one({'email': email}, {'$inc': {'credits': -1}})
+    return True
 
 app = Flask(__name__, static_folder=FRONTEND_BUILD_DIR, static_url_path='')
 
@@ -37,6 +94,59 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_DIR
 
 # Allow requests from frontend
 CORS(app)
+
+# --- Auth & Credits Endpoints ---
+@app.route('/signup', methods=['POST'])
+def signup():
+    data = request.json
+    email = data.get('email')
+    password = data.get('password')
+    if not email or not password:
+        return jsonify({'success': False, 'message': 'Email and password required'}), 400
+    if create_user(email, password):
+        return jsonify({'success': True, 'message': 'User created'})
+    else:
+        return jsonify({'success': False, 'message': 'User already exists'}), 409
+    
+@app.route('/logout', methods=['POST'])
+def logout():
+    # For stateless JWT or sessionless, just return success. For session-based, clear session here.
+    return jsonify({'success': True, 'message': 'Logged out'})
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.json
+    email = data.get('email')
+    password = data.get('password')
+    if authenticate(email, password):
+        return jsonify({'success': True, 'message': 'Login successful'})
+    else:
+        return jsonify({'success': False, 'message': 'Invalid credentials'}), 401
+
+@app.route('/get_credits', methods=['POST'])
+def get_credits_route():
+    data = request.json
+    email = data.get('email')
+    password = data.get('password')
+    if authenticate(email, password):
+        credits = get_credits(email)
+        return jsonify({'success': True, 'credits': credits})
+    else:
+        return jsonify({'success': False, 'message': 'Invalid credentials'}), 401
+
+@app.route('/use_credit', methods=['POST'])
+def use_credit_route():
+    data = request.json
+    email = data.get('email')
+    password = data.get('password')
+    if authenticate(email, password):
+        if use_credit(email):
+            credits = get_credits(email)
+            return jsonify({'success': True, 'credits': credits})
+        else:
+            return jsonify({'success': False, 'message': 'No credits left'}), 403
+    else:
+        return jsonify({'success': False, 'message': 'Invalid credentials'}), 401
 
 gpt_engine = GPTEngine()
 
@@ -60,6 +170,18 @@ def health():
 def ask():
     # Log the OS type for each request (cross-platform support)
     print(f"[DEBUG] Backend running on OS: {platform.system()} {platform.release()} ({platform.platform()})")
+    # Block if user has no credits
+    email = None
+    if request.content_type and request.content_type.startswith('multipart/form-data'):
+        email = request.form.get('email', None)
+    else:
+        data = request.get_json(silent=True)
+        if data:
+            email = data.get('email', None)
+    if email:
+        user = get_user(email)
+        if not user or user.get('credits', 0) <= 0:
+            return jsonify({'answer': 'No credits left. Please purchase more credits to continue.'}), 403
     # If multipart/form-data, handle file upload
     if request.content_type and request.content_type.startswith('multipart/form-data'):
         question = request.form.get('question', '')
@@ -107,14 +229,15 @@ def ask():
             print(f"[DEBUG] Smart mode requested - using resume context (resume_text_len={len(resume_text) if resume_text else 0})")
             if not resume_text or not resume_text.strip():
                 return jsonify({
-                    'answer': 'Could not extract any text from the uploaded resume. If your PDF is a scanned image, try a text-based PDF or upload a .txt file instead.'
+                    'answer': 'Could not extract any text from the uploaded resume. If your PDF is a scanned image, try a text-based PDF or upload a .txt file instead.',
+                    'resume_text': ''
                 }), 422
             answer = gpt_engine.generate_response(question, resume_text=resume_text, mode="resume", history=history)
+            return jsonify({'answer': answer, 'resume_text': resume_text})
         else:
             # Global mode
             answer = gpt_engine.generate_response(question, resume_text=resume_text, mode="global", history=history)
-        
-        return jsonify({'answer': answer})
+            return jsonify({'answer': answer})
     # Else, handle JSON (old flow)
     data = request.get_json()
     question = data.get('question', '')
