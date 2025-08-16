@@ -103,59 +103,44 @@ class GPTEngine:
                     if any(text.startswith(gs) for gs in generic_starts) and len(resume_keywords & answer_words) == 0:
                         return True
                     return False
-                # If answer is a template or not resume-based, always fallback to a direct, minimal, first-person answer using resume facts only
-                if is_template(answer, resume_text):
-                    # Extract key resume facts
-                    # Dynamically extract and combine resume facts for a natural, first-person answer
-                    # Avoid 'My name is I.' and similar artifacts
-                    name_match = _re.search(r"name[:\-]?\s*([A-Za-z][A-Za-z .'-]+)", resume_text, _re.IGNORECASE)
-                    name = name_match.group(1).strip() if name_match else None
-                    role_match = _re.search(r"(developer|engineer|manager|designer|analyst|consultant|scientist|specialist|lead|intern|student)", resume_text, _re.IGNORECASE)
-                    role = role_match.group(1).capitalize() if role_match else None
-                    exp_match = _re.search(r"(\d+\+?)\s+years? of experience", resume_text, _re.IGNORECASE)
-                    exp = exp_match.group(1) + " years" if exp_match else None
-                    company_match = _re.search(r"at ([A-Za-z0-9 &.]+)[.,]", resume_text)
-                    company = company_match.group(1).strip() if company_match else None
-                    skills_match = _re.search(r"skills?[:\-]?\s*([A-Za-z0-9, .]+)", resume_text, _re.IGNORECASE)
-                    skills = skills_match.group(1).strip() if skills_match else None
-                    degree_match = _re.search(r"(bachelor|master|phd|b\.?tech|m\.?tech|mba|bsc|msc|b\.e\.|m\.e\.|bca|mca)", resume_text, _re.IGNORECASE)
-                    degree = degree_match.group(1) if degree_match else None
-                    # Compose a natural, non-generic answer
-                    facts = []
-                    # Only use real, non-placeholder facts
-                    if name and name.lower() not in ["i", "your name", "name"]:
-                        facts.append(f"My name is {name}.")
-                    if role and role.lower() != "engineer":
-                        role_str = role
-                    else:
-                        role_str = None
-                    if role_str and exp and company:
-                        facts.append(f"I am a {role_str} with {exp} of experience, currently at {company}.")
-                    elif role_str and exp:
-                        facts.append(f"I am a {role_str} with {exp} of experience.")
-                    elif role_str and company:
-                        facts.append(f"I am a {role_str} currently at {company}.")
-                    elif role_str:
-                        facts.append(f"I am a {role_str}.")
-                    if degree:
-                        facts.append(f"I hold a {degree} degree.")
-                    if skills and skills.lower() not in ["languages", "skills"]:
-                        facts.append(f"My key skills include {skills}.")
-                    # Only return if at least two real facts are present
-                    real_facts = [f for f in facts if not any(x in f.lower() for x in ["i.", "engineer", "languages", "skills", "your name", "name is i"])]
-                    if len(real_facts) >= 2:
-                        answer_body = " ".join(real_facts)
-                        if self._is_intro_question(question):
-                            answer = answer_body
-                        else:
-                            answer = answer_body + " " + question.strip().capitalize()
-                    elif len(real_facts) == 1:
-                        if self._is_intro_question(question):
-                            answer = real_facts[0]
-                        else:
-                            answer = real_facts[0] + " " + question.strip().capitalize()
-                    else:
-                        answer = "Not enough information in the resume to answer this question."
+                # In Smart mode, always return the OpenAI-generated answer unless it is a template or forbidden phrase.
+                # If answer is not based on resume context (no overlap with resume keywords), provide a general answer (not a template).
+                forbidden = [
+                    "template", "sample", "example", "generic", "fallback", "instructional", "structured", "suggested", "possible answer", "response:",
+                    "this is a template", "here is a template", "here is an example", "here is a sample", "sample response", "for example", "for instance"
+                ]
+                # Check for forbidden phrases
+                if any(f in answer.lower() for f in forbidden):
+                    answer = "[Error: The answer was blocked because it looked like a template or sample. Please rephrase your question.]"
+                else:
+                    # Check if answer is based on resume context (overlap with resume keywords)
+                    resume_keywords = set(w.lower() for w in _re.findall(r"[A-Za-z]{4,}", resume_text))
+                    answer_words = set(w.lower() for w in _re.findall(r"[A-Za-z]{4,}", answer))
+                    # If no overlap and resume doesn't cover the question, provide a general answer (not a template)
+                    if len(resume_keywords & answer_words) == 0:
+                        # General mode system prompt
+                        general_prompt = (
+                            "You are a helpful interview assistant. Provide a concise, practical, and specific answer to the user's question. Do not use a template, sample, or generic structure. Answer in first person as if you are the user."
+                        )
+                        messages = [
+                            {"role": "system", "content": general_prompt},
+                            {"role": "user", "content": question}
+                        ]
+                        try:
+                            response2 = self.client.chat.completions.create(
+                                model="gpt-4o",
+                                messages=messages,
+                                max_tokens=256,
+                                temperature=0.6,
+                            )
+                            answer2 = response2.choices[0].message.content.strip()
+                            # Block if general answer is a template
+                            if any(f in answer2.lower() for f in forbidden):
+                                answer = "[Error: The answer was blocked because it looked like a template or sample. Please rephrase your question.]"
+                            else:
+                                answer = answer2
+                        except Exception as e:
+                            answer = "[Error: Could not generate a general answer.]"
             print(f"[DEBUG] Answer returned (mode={mode}): {answer[:300]}")
             sys.stdout.flush()
             return answer

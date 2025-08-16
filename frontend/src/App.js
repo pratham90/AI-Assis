@@ -3,7 +3,7 @@ import './App.css';
 
 
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || 'http://localhost:5000';
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 
 function App() {
   // Logout handler (must be defined before use)
@@ -335,8 +335,6 @@ function App() {
         formData.append('mode', 'resume');
         formData.append('history', JSON.stringify(history));
         formData.append('resume', resumeFile); // Always send resume file
-        if (email) formData.append('email', email);
-        if (password) formData.append('password', password);
         res = await fetch(`${BACKEND_URL}/ask`, {
           method: 'POST',
           body: formData
