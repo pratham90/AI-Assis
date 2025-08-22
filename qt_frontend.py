@@ -220,27 +220,33 @@ class MainWidget(QWidget):
         self.recognizer = sr.Recognizer()
         # Robust mic selection
         try:
-            mic_list = sr.Microphone.list_microphone_names()
-            pa = pyaudio.PyAudio()
             mic_index = None
             mic_name = None
-            for i in range(pa.get_device_count()):
-                info = pa.get_device_info_by_index(i)
-                if info.get('maxInputChannels', 0) > 0:
-                    mic_index = i
-                    mic_name = info.get('name', mic_list[i] if i < len(mic_list) else f'Device {i}')
-                    break
-            pa.terminate()
-            if mic_index is None and mic_list:
-                mic_index = 0
-                mic_name = mic_list[0]
+            if hasattr(self, 'mic_selector') and self.mic_selector.count() > 0:
+                # stored device index in item data
+                mic_index = self.mic_selector.currentData()
+                mic_name = self.mic_selector.currentText()
+            else:
+                mic_list = sr.Microphone.list_microphone_names()
+                pa = pyaudio.PyAudio()
+                for i in range(pa.get_device_count()):
+                    info = pa.get_device_info_by_index(i)
+                    if info.get('maxInputChannels', 0) > 0:
+                        mic_index = i
+                        mic_name = info.get('name', mic_list[i] if i < len(mic_list) else f'Device {i}')
+                        break
+                pa.terminate()
+                if mic_index is None and mic_list:
+                    mic_index = 0
+                    mic_name = mic_list[0]
             if mic_index is not None:
                 self.status_label.setText(f"Using mic: {mic_name}. Listening... (Speak now)")
-                self.mic = sr.Microphone(device_index=mic_index)
+                self.selected_mic_index = mic_index
             else:
                 raise Exception("No microphone found. Please connect a mic or headset.")
         except Exception as e:
             self.status_label.setText(f"Microphone error: {e}")
+            self.answers_box.append(f"[DEBUG] Microphone error: {e}")
             self.listening = False
             return
         self.listen_real()
@@ -275,7 +281,7 @@ class MainWidget(QWidget):
             RATE = 16000
             RECORD_SECONDS = 5
             p = pyaudio.PyAudio()
-            mic_index = getattr(self, 'mic', None).device_index if hasattr(self, 'mic') and hasattr(self.mic, 'device_index') else None
+            mic_index = getattr(self, 'selected_mic_index', None)
             stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK, input_device_index=mic_index)
             frames = []
             self.status_label.setText("Listening... (Speak now)")
@@ -288,6 +294,13 @@ class MainWidget(QWidget):
             stream.close()
             sampwidth = p.get_sample_size(FORMAT)
             p.terminate()
+
+            # Optional calibration to improve SNR
+            try:
+                with sr.Microphone(device_index=mic_index) as source:
+                    self.recognizer.adjust_for_ambient_noise(source, duration=0.4)
+            except Exception:
+                pass
 
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_wav:
                 tmp_wav_path = tmp_wav.name
@@ -307,7 +320,6 @@ class MainWidget(QWidget):
                     data = res.json()
                     recognized_text = (data.get('text') or data.get('transcript') or '').strip()
                     if not recognized_text and isinstance(data, dict):
-                        # Hosted backend may differ. Try nested or alt fields
                         recognized_text = (data.get('data', {}) or {}).get('text', '')
                 else:
                     self.answers_box.append(f"[DEBUG] Backend /listen error: {res.status_code} {res.text}")
@@ -315,8 +327,16 @@ class MainWidget(QWidget):
                 self.answers_box.append(f"[DEBUG] Error contacting backend /listen: {e}")
 
             if not recognized_text:
-                self.answers_box.append("[DEBUG] Falling back to local STT...")
+                self.answers_box.append("[DEBUG] Falling back to local STT (Google)...")
                 recognized_text = self._local_stt_fallback(frames, RATE, sampwidth)
+                if not recognized_text:
+                    try:
+                        import pocketsphinx  # noqa: F401
+                        self.answers_box.append("[DEBUG] Trying offline STT (Sphinx)...")
+                        audio_data = sr.AudioData(b"".join(frames), RATE, sampwidth)
+                        recognized_text = self.recognizer.recognize_sphinx(audio_data)
+                    except Exception as e:
+                        self.answers_box.append(f"[DEBUG] Offline STT unavailable or failed: {e}")
 
             if recognized_text:
                 self.answers_box.append(f"[DEBUG] Recognized: {recognized_text}")
@@ -460,6 +480,24 @@ class MainWidget(QWidget):
         q_label = QLabel("Questions")
         q_label.setStyleSheet("color: #fff;")
         left_layout.addWidget(q_label)
+
+        # Microphone selection row
+        from PySide6.QtWidgets import QComboBox
+        mic_row = QHBoxLayout()
+        self.mic_selector = QComboBox()
+        self.mic_selector.setStyleSheet("background: rgba(255,255,255,0.1); color: #fff; border-radius: 6px; padding: 4px;")
+        refresh_btn = QPushButton("↻")
+        refresh_btn.setFixedWidth(34)
+        refresh_btn.setStyleSheet("background: #111; color: #aaa; border-radius: 6px;")
+        refresh_btn.clicked.connect(self._load_mics)
+        calib_btn = QPushButton("Calibrate")
+        calib_btn.setStyleSheet("background: #111; color: #4F8CFF; border-radius: 6px; padding: 4px 8px;")
+        calib_btn.clicked.connect(self._calibrate)
+        mic_row.addWidget(self.mic_selector)
+        mic_row.addWidget(refresh_btn)
+        mic_row.addWidget(calib_btn)
+        left_layout.addLayout(mic_row)
+
         self.mic_button = QPushButton("🎤 Start Listening", self)
         self.mic_button.setCursor(Qt.PointingHandCursor)
         self.mic_button.setStyleSheet("""
@@ -505,6 +543,42 @@ class MainWidget(QWidget):
         card_layout.addWidget(right)
 
         layout.addWidget(card, alignment=Qt.AlignCenter)
+        
+        # Initialize mic list on first load
+        QTimer.singleShot(0, self._load_mics)
+
+    def _load_mics(self):
+        try:
+            self.mic_selector.clear()
+            pa = pyaudio.PyAudio()
+            count = pa.get_device_count()
+            added = 0
+            for i in range(count):
+                info = pa.get_device_info_by_index(i)
+                if info.get('maxInputChannels', 0) > 0:
+                    name = info.get('name', f'Device {i}')
+                    self.mic_selector.addItem(name, i)
+                    added += 1
+            pa.terminate()
+            if added == 0:
+                self.mic_selector.addItem("No input devices found", None)
+            self.answers_box.append(f"[DEBUG] Mic devices loaded: {added}")
+        except Exception as e:
+            self.answers_box.append(f"[DEBUG] Failed to load mic devices: {e}")
+
+    def _calibrate(self):
+        try:
+            idx = self.mic_selector.currentData()
+            if idx is None:
+                QMessageBox.warning(self, "Calibration", "No input device selected.")
+                return
+            with sr.Microphone(device_index=idx) as source:
+                self.answers_box.append("[DEBUG] Calibrating... please stay quiet")
+                self.recognizer = getattr(self, 'recognizer', sr.Recognizer())
+                self.recognizer.adjust_for_ambient_noise(source, duration=1.0)
+                self.answers_box.append("[DEBUG] Calibration complete")
+        except Exception as e:
+            self.answers_box.append(f"[DEBUG] Calibration failed: {e}")
 
     def ask(self):
         pass  # Disable manual ask
